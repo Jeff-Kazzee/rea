@@ -446,6 +446,44 @@ it.each([
   },
 );
 
+it.each(["failure", "cancelled", "skipped", "missing"])(
+  "requires fresh Node security policy despite successful lanes: %s",
+  async (result) => {
+    const required = await requiredNeeds();
+    const needs: Record<
+      string,
+      { result: string; outputs?: Record<string, string> }
+    > = Object.fromEntries(
+      required.needs.map((name) => [name, { result: "success" }]),
+    );
+    needs.changes = {
+      result: "success",
+      outputs: {
+        ...Object.fromEntries(
+          (await scopeFlags()).map((flag) => [flag, "false"]),
+        ),
+        tier: "fast",
+      },
+    };
+    if (result === "missing") delete needs["node-security"];
+    else needs["node-security"] = { result };
+    await expect(
+      executeWorkflowFixture(
+        process.execPath,
+        [
+          fileURLToPath(
+            new URL("../../../scripts/ci/required.mjs", import.meta.url),
+          ),
+        ],
+        { env: { ...process.env, CI_JOBS: JSON.stringify(needs) } },
+      ),
+    ).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("node-security"),
+    });
+  },
+);
+
 it("rejects incomplete or malformed classification even when available jobs succeeded", async () => {
   const flags = await scopeFlags();
   const valid = {
@@ -465,6 +503,7 @@ it("rejects incomplete or malformed classification even when available jobs succ
           ...process.env,
           CI_JOBS: JSON.stringify({
             changes: { result: "success", outputs },
+            "node-security": { result: "success" },
             static: { result: "success" },
             test: { result: "success" },
           }),
@@ -531,6 +570,7 @@ it("fails fast only for ordinary PR matrices and rejects partial portable feedba
           code: "true",
         },
       },
+      "node-security": { result: "success" },
       static: { result: "success" },
       build: { result: "success" },
       test: { result: "success" },

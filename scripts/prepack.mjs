@@ -1,3 +1,7 @@
+import { assertNodeSecurity } from "./check-node-security.mjs";
+
+assertNodeSecurity();
+
 import { spawnSync } from "node:child_process";
 import { access } from "node:fs/promises";
 import { dirname, join } from "node:path";

@@ -329,7 +329,7 @@ it("collects basic CI telemetry before optional dependency installation can fail
     expect(installation).toBeGreaterThan(collection);
   }
   expect(steps[installation]).toMatchObject({
-    run: "npm ci",
+    run: "npm run security:check && npm ci",
     "continue-on-error": true,
   });
   expect(
