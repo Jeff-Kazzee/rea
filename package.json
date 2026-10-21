@@ -42,7 +42,7 @@
     "rea-agents": "scripts/rea.mjs"
   },
   "engines": {
-    "node": "^22.19.0 || ^24.11.0 || >=26.0.0"
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
   },
   "packageManager": "npm@11.16.0",
   "files": [
@@ -95,7 +95,8 @@
     "bridge/pwndbg/core_context.py",
     "third_party/pwndbg/README.md",
     "third_party/pwndbg/LICENSE.md",
-    "licenses"
+    "licenses",
+    "scripts/check-node-security.mjs"
   ],
   "scripts": {
     "release:notes": "node scripts/release-notes.mjs",
@@ -106,7 +107,7 @@
     "mcp-catalog:generate": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run artifacts:mcp-catalog",
     "mcp-catalog:check": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run mcp-catalog:check:built",
     "prebuild": "npm run deps:check",
-    "build": "node scripts/run-exclusive.mjs artifacts turbo run artifacts:skills --force",
+    "build": "npm run security:check && node scripts/run-exclusive.mjs artifacts turbo run artifacts:skills --force",
     "precheck": "npm run deps:check",
     "check": "node scripts/run-exclusive.mjs artifacts turbo run typecheck lint:built format:check knip metadata:check && npm run verify:architecture-guards",
     "precheck:fast": "npm run deps:check",
@@ -121,8 +122,8 @@
     "check:ci": "node scripts/run-exclusive.mjs artifacts npm run check:ci:tasks && npm run verify:architecture-guards",
     "check:ci:tasks": "turbo run typecheck lint:built format:check knip metadata:check jscpd scan:todos",
     "ci:static-context": "node scripts/ci/static-task-context.mjs",
-    "build:cached": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run artifacts:skills",
-    "build:termux": "node scripts/run-exclusive.mjs artifacts npm run build:termux:run",
+    "build:cached": "npm run security:check && node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run artifacts:skills",
+    "build:termux": "npm run security:check && node scripts/run-exclusive.mjs artifacts npm run build:termux:run",
     "build:termux:run": "npm run compile:termux && npm run artifacts:skills",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
@@ -250,8 +251,8 @@
     "evidence:check": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run evidence:check:built",
     "predocs:dev": "npm run docs:generate",
     "docs:dev": "vitepress dev docs",
-    "predocs:build": "npm run docs:generate",
-    "docs:build": "vitepress build docs",
+    "predocs:build": "npm run security:check && npm run docs:generate",
+    "docs:build": "npm run security:check && vitepress build docs",
     "docs:preview": "vitepress preview docs",
     "docs:generate": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts npm run docs:prepare",
     "docs:check": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run docs:check:built && npm run test:local -- tests/conformance/readmeConsistency.test.ts",
@@ -267,7 +268,7 @@
     "test:sqlite:run": "vitest run src/application/sqlite/ tests/boundary/sqlite/ tests/acceptance/sqliteDatabaseCli.test.ts tests/boundary/mcp/serverLifecycleMcp.test.ts",
     "build:windows-native": "node scripts/build-windows-native.mjs",
     "verify:windows-native:artifact": "node scripts/verify-windows-native-artifact.mjs",
-    "prepublishOnly": "npm run verify:windows-native:artifact",
+    "prepublishOnly": "npm run security:check && npm run verify:windows-native:artifact",
     "verify:cutter": "npm run build:cached && node scripts/verify-real-cutter.mjs",
     "verify:windows-native": "node scripts/verify-windows-native.mjs",
     "verify:ghidra:windows:package": "node scripts/verify-packaged-ghidra-windows.mjs",
@@ -304,7 +305,10 @@
     "docs:prepare": "node scripts/generate-package-metadata.mjs && turbo run artifacts:product-catalog artifacts:managed-evidence artifacts:error-schema",
     "verify:web:qlog": "npm run build:cached && node scripts/verify-qlog-captures.mjs",
     "licenses:generate": "node scripts/generate-third-party-inventory.mjs",
-    "licenses:check": "node scripts/generate-third-party-inventory.mjs --check"
+    "licenses:check": "node scripts/generate-third-party-inventory.mjs --check",
+    "security:node": "node scripts/check-node-security.mjs",
+    "security:check": "node scripts/check-node-security.mjs && npm audit --package-lock-only --ignore-scripts --include=dev --include=optional --include=peer --audit-level=low --registry=https://registry.npmjs.org",
+    "preinstall": "node scripts/check-node-security.mjs"
   },
   "lint-staged": {
     "*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}": [
@@ -386,7 +390,8 @@
     "typescript-termux": "npm:typescript@5.9.3",
     "typescript6": "npm:typescript@6.0.3",
     "vitepress": "1.6.4",
-    "vitest": "5.0.3"
+    "vitest": "5.0.3",
+    "vite": "8.3.3"
   },
   "optionalDependencies": {
     "frida": "17.23.2"

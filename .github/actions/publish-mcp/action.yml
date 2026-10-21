@@ -7,6 +7,13 @@ inputs:
 runs:
   using: composite
   steps:
+    - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version-file: ${{ github.workspace }}/.nvmrc
+        package-manager-cache: false
+    - name: Check the actual Node security policy
+      shell: bash
+      run: node "${GITHUB_WORKSPACE}/scripts/check-node-security.mjs"
     - name: Install MCP Registry publisher
       shell: bash
       working-directory: ${{ inputs.directory }}

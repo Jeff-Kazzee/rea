@@ -35,7 +35,128 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Respect finalized release notes
+      - name: Verify every managed action interpreter before actions
+        id: action-runtime-bootstrap
+        shell: pwsh
+        run: |
+          # Caller contract from immutable action manifests. No pre hooks declared.
+          $requiredActionRuntimes = @('node20')
+          if (@($requiredActionRuntimes | Where-Object { $_ -cne 'node24' }).Count) {
+            throw 'CI_UNSUPPORTED_ACTION_RUNTIME: this required job still declares Node 20 actions. Review compatible action replacements before execution. The node24 probe cannot clear Node 20.'
+          }
+          # Native hosted jobs only. Review immutable action manifests for pre hooks before use.
+          # No run step can precede action pre hooks, runner job hooks or early hashFiles().
+          # Any failure/always diagnostic action must also require this step's success.
+          # Floors: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+          # Expiry uses the schedule end date as an exclusive UTC cutoff, without an extra day.
+          # https://github.com/nodejs/Release/blob/main/schedule.json
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-ActionNodeVersion {
+            param([string]$Runtime, [string]$Version, [datetime]$AsOf = [datetime]::UtcNow)
+            $match = [regex]::Match($Version, '\A24\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z')
+            if ($Runtime -cne 'node24' -or -not $match.Success) {
+              throw 'CI_UNSUPPORTED_ACTION_RUNTIME: require a reviewed stable node24 interpreter; EOL, unknown and custom runtimes are refused.'
+            }
+            $minor = [int]$match.Groups[1].Value
+            $patch = [int]$match.Groups[2].Value
+            if ($minor -lt 22 -or ($minor -eq 22 -and $patch -lt 1) -or $AsOf.ToUniversalTime() -ge [datetime]::new(2028,4,30,0,0,0,[DateTimeKind]::Utc)) {
+              throw "CI_UNSUPPORTED_ACTION_RUNTIME: node24 requires Node 24.22.1 or later before its 2028-04-30 UTC expiry; received $Version. Use a patched provider image. Do not substitute PATH Node or waive a provider backport without evidence."
+            }
+          }
+
+          function Read-BoundedProbeText {
+            param([IO.Stream]$Stream, [datetime]$Deadline)
+            $buffer = [byte[]]::new(4097)
+            $used = 0
+            do {
+              $remaining = [int]($Deadline - [datetime]::UtcNow).TotalMilliseconds
+              if ($remaining -le 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $read = $Stream.ReadAsync($buffer, $used, $buffer.Length - $used)
+              if (-not $read.Wait($remaining)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $count = $read.Result
+              $used += $count
+            } while ($count -gt 0 -and $used -lt $buffer.Length)
+            if ($used -gt 4096) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: oversized interpreter output.' }
+            return [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $used)
+          }
+
+          function Get-BundledNodeInfo {
+            param([string]$Executable)
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add('--eval')
+            $start.ArgumentList.Add('process.stdout.write(JSON.stringify({version:process.versions.node,execPath:process.execPath}))')
+            $probe = [Diagnostics.Process]::new()
+            $probe.StartInfo = $start
+            $deadline = [datetime]::UtcNow.AddSeconds(5)
+            $started = $false
+            try {
+              $started = $probe.Start()
+              if (-not $started -or -not $probe.WaitForExit(5000)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe timed out.' }
+              $output = Read-BoundedProbeText $probe.StandardOutput.BaseStream $deadline
+              $errors = Read-BoundedProbeText $probe.StandardError.BaseStream $deadline
+              if ($probe.ExitCode -ne 0 -or $errors.Length -ne 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe failed or emitted diagnostics.' }
+              $info = ConvertFrom-Json -InputObject $output -AsHashtable
+              if ($info.version -isnot [string] -or $info.execPath -isnot [string]) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: malformed interpreter identity.' }
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetFullPath($Executable), [IO.Path]::GetFullPath($info.execPath), $comparison)) {
+                throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter identity does not match the bundled executable.'
+              }
+              return $info
+            } finally {
+              try {
+                if ($started -and -not $probe.HasExited) { $probe.Kill($true); $probe.WaitForExit(1000) | Out-Null }
+              } finally { $probe.Dispose() }
+            }
+          }
+
+          function Assert-RunnerActionRuntimes {
+            param([string[]]$Runtimes)
+            if (-not $Runtimes -or @($Runtimes | Where-Object { $_ -cne 'node24' }).Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: only explicitly reviewed node24 actions are supported; node20 is EOL.' }
+            $hostOS = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { '' }
+            if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne $hostOS -or $env:RUNNER_ARCH -notin @('X64','ARM64')) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unsupported hosted platform.' }
+            $unsafe = @(Get-ChildItem Env: | Where-Object {
+              $_.Value -and ($_.Name -in @('NODE_OPTIONS','ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION','ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION','ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED') -or $_.Name -match '\AFORCE_JAVASCRIPT_ACTIONS_TO_NODE[0-9]+\z')
+            })
+            if ($unsafe.Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreviewed Node options, migration override or runner hook. Refuse without printing its value.' }
+            $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction Stop)
+            if ($workers.Count -ne 1) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: missing or ambiguous Runner.Worker.' }
+            $ancestor = Get-Process -Id $PID -ErrorAction Stop
+            $owned = $false
+            for ($depth = 0; $ancestor -and $depth -lt 16; $depth++) {
+              if ($ancestor.Id -eq $workers[0].Id) { $owned = $true; break }
+              $ancestor = $ancestor.Parent
+            }
+            if (-not $owned) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: Runner.Worker is not a verified ancestor.' }
+            $workerPath = $workers[0].Path
+            $workerName = if ($IsWindows) { 'Runner.Worker.exe' } else { 'Runner.Worker' }
+            if (-not $workerPath -or -not [IO.Path]::IsPathFullyQualified($workerPath) -or [IO.Path]::GetFileName($workerPath) -cne $workerName) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreadable native worker path.' }
+            $bin = [IO.Path]::GetDirectoryName($workerPath)
+            if ([IO.Path]::GetFileName($bin) -cne 'bin' -or -not [IO.File]::Exists((Join-Path $bin 'Runner.Worker.dll'))) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unfamiliar worker layout.' }
+            $runnerRoot = [IO.Path]::GetDirectoryName($bin)
+            foreach ($runtime in @($Runtimes | Select-Object -Unique)) {
+              $nodeName = if ($IsWindows) { 'node.exe' } else { 'node' }
+              $executable = Join-Path $runnerRoot "externals/$runtime/bin/$nodeName"
+              if (-not [IO.File]::Exists($executable)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: bundled action interpreter is missing.' }
+              $info = Get-BundledNodeInfo $executable
+              Assert-ActionNodeVersion $runtime $info.version
+              Write-Output "Verified bundled action interpreter: $executable Node $($info.version)"
+            }
+          }
+
+          # Enumerate every effective JavaScript action runtime from the reviewed manifests.
+          Assert-RunnerActionRuntimes -Runtimes @('node24')
+      - name: Hold uncleared package-manager startup before actions
+        id: package-manager-client
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          throw 'CI_UNREVIEWED_PACKAGE_MANAGER_CLIENT: the npm/Yarn startup boundary has no approved advisory disposition. Review the actual clients and their bundled dependencies before removing this hold. A clean project lock audit does not clear the clients.'
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Respect finalized release notes
         id: editorial
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -49,7 +170,7 @@ jobs:
           fi
 
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
-        if: steps.editorial.outputs.frozen != 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (steps.editorial.outputs.frozen != 'true') }}
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           target-branch: main
@@ -69,21 +190,148 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       sha: ${{ steps.release.outputs.sha }}
     steps:
-      - name: Check out reviewed release merge
+      - name: Verify every managed action interpreter before actions
+        id: action-runtime-bootstrap
+        shell: pwsh
+        run: |
+          # Caller contract from immutable action manifests. No pre hooks declared.
+          $requiredActionRuntimes = @('node20', 'node24')
+          if (@($requiredActionRuntimes | Where-Object { $_ -cne 'node24' }).Count) {
+            throw 'CI_UNSUPPORTED_ACTION_RUNTIME: this required job still declares Node 20 actions. Review compatible action replacements before execution. The node24 probe cannot clear Node 20.'
+          }
+          # Native hosted jobs only. Review immutable action manifests for pre hooks before use.
+          # No run step can precede action pre hooks, runner job hooks or early hashFiles().
+          # Any failure/always diagnostic action must also require this step's success.
+          # Floors: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+          # Expiry uses the schedule end date as an exclusive UTC cutoff, without an extra day.
+          # https://github.com/nodejs/Release/blob/main/schedule.json
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-ActionNodeVersion {
+            param([string]$Runtime, [string]$Version, [datetime]$AsOf = [datetime]::UtcNow)
+            $match = [regex]::Match($Version, '\A24\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z')
+            if ($Runtime -cne 'node24' -or -not $match.Success) {
+              throw 'CI_UNSUPPORTED_ACTION_RUNTIME: require a reviewed stable node24 interpreter; EOL, unknown and custom runtimes are refused.'
+            }
+            $minor = [int]$match.Groups[1].Value
+            $patch = [int]$match.Groups[2].Value
+            if ($minor -lt 22 -or ($minor -eq 22 -and $patch -lt 1) -or $AsOf.ToUniversalTime() -ge [datetime]::new(2028,4,30,0,0,0,[DateTimeKind]::Utc)) {
+              throw "CI_UNSUPPORTED_ACTION_RUNTIME: node24 requires Node 24.22.1 or later before its 2028-04-30 UTC expiry; received $Version. Use a patched provider image. Do not substitute PATH Node or waive a provider backport without evidence."
+            }
+          }
+
+          function Read-BoundedProbeText {
+            param([IO.Stream]$Stream, [datetime]$Deadline)
+            $buffer = [byte[]]::new(4097)
+            $used = 0
+            do {
+              $remaining = [int]($Deadline - [datetime]::UtcNow).TotalMilliseconds
+              if ($remaining -le 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $read = $Stream.ReadAsync($buffer, $used, $buffer.Length - $used)
+              if (-not $read.Wait($remaining)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $count = $read.Result
+              $used += $count
+            } while ($count -gt 0 -and $used -lt $buffer.Length)
+            if ($used -gt 4096) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: oversized interpreter output.' }
+            return [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $used)
+          }
+
+          function Get-BundledNodeInfo {
+            param([string]$Executable)
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add('--eval')
+            $start.ArgumentList.Add('process.stdout.write(JSON.stringify({version:process.versions.node,execPath:process.execPath}))')
+            $probe = [Diagnostics.Process]::new()
+            $probe.StartInfo = $start
+            $deadline = [datetime]::UtcNow.AddSeconds(5)
+            $started = $false
+            try {
+              $started = $probe.Start()
+              if (-not $started -or -not $probe.WaitForExit(5000)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe timed out.' }
+              $output = Read-BoundedProbeText $probe.StandardOutput.BaseStream $deadline
+              $errors = Read-BoundedProbeText $probe.StandardError.BaseStream $deadline
+              if ($probe.ExitCode -ne 0 -or $errors.Length -ne 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe failed or emitted diagnostics.' }
+              $info = ConvertFrom-Json -InputObject $output -AsHashtable
+              if ($info.version -isnot [string] -or $info.execPath -isnot [string]) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: malformed interpreter identity.' }
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetFullPath($Executable), [IO.Path]::GetFullPath($info.execPath), $comparison)) {
+                throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter identity does not match the bundled executable.'
+              }
+              return $info
+            } finally {
+              try {
+                if ($started -and -not $probe.HasExited) { $probe.Kill($true); $probe.WaitForExit(1000) | Out-Null }
+              } finally { $probe.Dispose() }
+            }
+          }
+
+          function Assert-RunnerActionRuntimes {
+            param([string[]]$Runtimes)
+            if (-not $Runtimes -or @($Runtimes | Where-Object { $_ -cne 'node24' }).Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: only explicitly reviewed node24 actions are supported; node20 is EOL.' }
+            $hostOS = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { '' }
+            if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne $hostOS -or $env:RUNNER_ARCH -notin @('X64','ARM64')) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unsupported hosted platform.' }
+            $unsafe = @(Get-ChildItem Env: | Where-Object {
+              $_.Value -and ($_.Name -in @('NODE_OPTIONS','ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION','ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION','ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED') -or $_.Name -match '\AFORCE_JAVASCRIPT_ACTIONS_TO_NODE[0-9]+\z')
+            })
+            if ($unsafe.Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreviewed Node options, migration override or runner hook. Refuse without printing its value.' }
+            $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction Stop)
+            if ($workers.Count -ne 1) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: missing or ambiguous Runner.Worker.' }
+            $ancestor = Get-Process -Id $PID -ErrorAction Stop
+            $owned = $false
+            for ($depth = 0; $ancestor -and $depth -lt 16; $depth++) {
+              if ($ancestor.Id -eq $workers[0].Id) { $owned = $true; break }
+              $ancestor = $ancestor.Parent
+            }
+            if (-not $owned) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: Runner.Worker is not a verified ancestor.' }
+            $workerPath = $workers[0].Path
+            $workerName = if ($IsWindows) { 'Runner.Worker.exe' } else { 'Runner.Worker' }
+            if (-not $workerPath -or -not [IO.Path]::IsPathFullyQualified($workerPath) -or [IO.Path]::GetFileName($workerPath) -cne $workerName) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreadable native worker path.' }
+            $bin = [IO.Path]::GetDirectoryName($workerPath)
+            if ([IO.Path]::GetFileName($bin) -cne 'bin' -or -not [IO.File]::Exists((Join-Path $bin 'Runner.Worker.dll'))) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unfamiliar worker layout.' }
+            $runnerRoot = [IO.Path]::GetDirectoryName($bin)
+            foreach ($runtime in @($Runtimes | Select-Object -Unique)) {
+              $nodeName = if ($IsWindows) { 'node.exe' } else { 'node' }
+              $executable = Join-Path $runnerRoot "externals/$runtime/bin/$nodeName"
+              if (-not [IO.File]::Exists($executable)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: bundled action interpreter is missing.' }
+              $info = Get-BundledNodeInfo $executable
+              Assert-ActionNodeVersion $runtime $info.version
+              Write-Output "Verified bundled action interpreter: $executable Node $($info.version)"
+            }
+          }
+
+          # Enumerate every effective JavaScript action runtime from the reviewed manifests.
+          Assert-RunnerActionRuntimes -Runtimes @('node24')
+      - name: Hold uncleared package-manager startup before actions
+        id: package-manager-client
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          throw 'CI_UNREVIEWED_PACKAGE_MANAGER_CLIENT: the npm/Yarn startup boundary has no approved advisory disposition. Review the actual clients and their bundled dependencies before removing this hold. A clean project lock audit does not clear the clients.'
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Check out reviewed release merge
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
 
-      - run: npm ci
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Check the actual Node security policy
+        run: node scripts/check-node-security.mjs
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        run: npm run security:check && npm ci
 
-      - name: Validate reviewed merge before release creation
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Validate reviewed merge before release creation
         env:
           SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
@@ -94,7 +342,8 @@ jobs:
           node scripts/verify-release-checkpoint.mjs \
             --phase publish --release-branch main --source-sha "$SOURCE_SHA"
 
-      - name: Validate finalized notes before release creation
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Validate finalized notes before release creation
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -104,7 +353,8 @@ jobs:
           node scripts/release-notes.mjs publication --repository "$GH_REPO" \
             --source "$SOURCE_SHA" --pr "$RELEASE_PR"
 
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -112,7 +362,8 @@ jobs:
           skip-github-release: false
           skip-github-pull-request: true
 
-      - name: Bind publication to the reviewed merge
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Bind publication to the reviewed merge
         env:
           RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
@@ -138,7 +389,128 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       sha: ${{ steps.release.outputs.sha }}
     steps:
-      - name: Validate release selection
+      - name: Verify every managed action interpreter before actions
+        id: action-runtime-bootstrap
+        shell: pwsh
+        run: |
+          # Caller contract from immutable action manifests. No pre hooks declared.
+          $requiredActionRuntimes = @('node20', 'node24')
+          if (@($requiredActionRuntimes | Where-Object { $_ -cne 'node24' }).Count) {
+            throw 'CI_UNSUPPORTED_ACTION_RUNTIME: this required job still declares Node 20 actions. Review compatible action replacements before execution. The node24 probe cannot clear Node 20.'
+          }
+          # Native hosted jobs only. Review immutable action manifests for pre hooks before use.
+          # No run step can precede action pre hooks, runner job hooks or early hashFiles().
+          # Any failure/always diagnostic action must also require this step's success.
+          # Floors: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+          # Expiry uses the schedule end date as an exclusive UTC cutoff, without an extra day.
+          # https://github.com/nodejs/Release/blob/main/schedule.json
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-ActionNodeVersion {
+            param([string]$Runtime, [string]$Version, [datetime]$AsOf = [datetime]::UtcNow)
+            $match = [regex]::Match($Version, '\A24\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z')
+            if ($Runtime -cne 'node24' -or -not $match.Success) {
+              throw 'CI_UNSUPPORTED_ACTION_RUNTIME: require a reviewed stable node24 interpreter; EOL, unknown and custom runtimes are refused.'
+            }
+            $minor = [int]$match.Groups[1].Value
+            $patch = [int]$match.Groups[2].Value
+            if ($minor -lt 22 -or ($minor -eq 22 -and $patch -lt 1) -or $AsOf.ToUniversalTime() -ge [datetime]::new(2028,4,30,0,0,0,[DateTimeKind]::Utc)) {
+              throw "CI_UNSUPPORTED_ACTION_RUNTIME: node24 requires Node 24.22.1 or later before its 2028-04-30 UTC expiry; received $Version. Use a patched provider image. Do not substitute PATH Node or waive a provider backport without evidence."
+            }
+          }
+
+          function Read-BoundedProbeText {
+            param([IO.Stream]$Stream, [datetime]$Deadline)
+            $buffer = [byte[]]::new(4097)
+            $used = 0
+            do {
+              $remaining = [int]($Deadline - [datetime]::UtcNow).TotalMilliseconds
+              if ($remaining -le 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $read = $Stream.ReadAsync($buffer, $used, $buffer.Length - $used)
+              if (-not $read.Wait($remaining)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $count = $read.Result
+              $used += $count
+            } while ($count -gt 0 -and $used -lt $buffer.Length)
+            if ($used -gt 4096) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: oversized interpreter output.' }
+            return [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $used)
+          }
+
+          function Get-BundledNodeInfo {
+            param([string]$Executable)
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add('--eval')
+            $start.ArgumentList.Add('process.stdout.write(JSON.stringify({version:process.versions.node,execPath:process.execPath}))')
+            $probe = [Diagnostics.Process]::new()
+            $probe.StartInfo = $start
+            $deadline = [datetime]::UtcNow.AddSeconds(5)
+            $started = $false
+            try {
+              $started = $probe.Start()
+              if (-not $started -or -not $probe.WaitForExit(5000)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe timed out.' }
+              $output = Read-BoundedProbeText $probe.StandardOutput.BaseStream $deadline
+              $errors = Read-BoundedProbeText $probe.StandardError.BaseStream $deadline
+              if ($probe.ExitCode -ne 0 -or $errors.Length -ne 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe failed or emitted diagnostics.' }
+              $info = ConvertFrom-Json -InputObject $output -AsHashtable
+              if ($info.version -isnot [string] -or $info.execPath -isnot [string]) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: malformed interpreter identity.' }
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetFullPath($Executable), [IO.Path]::GetFullPath($info.execPath), $comparison)) {
+                throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter identity does not match the bundled executable.'
+              }
+              return $info
+            } finally {
+              try {
+                if ($started -and -not $probe.HasExited) { $probe.Kill($true); $probe.WaitForExit(1000) | Out-Null }
+              } finally { $probe.Dispose() }
+            }
+          }
+
+          function Assert-RunnerActionRuntimes {
+            param([string[]]$Runtimes)
+            if (-not $Runtimes -or @($Runtimes | Where-Object { $_ -cne 'node24' }).Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: only explicitly reviewed node24 actions are supported; node20 is EOL.' }
+            $hostOS = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { '' }
+            if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne $hostOS -or $env:RUNNER_ARCH -notin @('X64','ARM64')) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unsupported hosted platform.' }
+            $unsafe = @(Get-ChildItem Env: | Where-Object {
+              $_.Value -and ($_.Name -in @('NODE_OPTIONS','ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION','ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION','ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED') -or $_.Name -match '\AFORCE_JAVASCRIPT_ACTIONS_TO_NODE[0-9]+\z')
+            })
+            if ($unsafe.Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreviewed Node options, migration override or runner hook. Refuse without printing its value.' }
+            $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction Stop)
+            if ($workers.Count -ne 1) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: missing or ambiguous Runner.Worker.' }
+            $ancestor = Get-Process -Id $PID -ErrorAction Stop
+            $owned = $false
+            for ($depth = 0; $ancestor -and $depth -lt 16; $depth++) {
+              if ($ancestor.Id -eq $workers[0].Id) { $owned = $true; break }
+              $ancestor = $ancestor.Parent
+            }
+            if (-not $owned) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: Runner.Worker is not a verified ancestor.' }
+            $workerPath = $workers[0].Path
+            $workerName = if ($IsWindows) { 'Runner.Worker.exe' } else { 'Runner.Worker' }
+            if (-not $workerPath -or -not [IO.Path]::IsPathFullyQualified($workerPath) -or [IO.Path]::GetFileName($workerPath) -cne $workerName) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreadable native worker path.' }
+            $bin = [IO.Path]::GetDirectoryName($workerPath)
+            if ([IO.Path]::GetFileName($bin) -cne 'bin' -or -not [IO.File]::Exists((Join-Path $bin 'Runner.Worker.dll'))) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unfamiliar worker layout.' }
+            $runnerRoot = [IO.Path]::GetDirectoryName($bin)
+            foreach ($runtime in @($Runtimes | Select-Object -Unique)) {
+              $nodeName = if ($IsWindows) { 'node.exe' } else { 'node' }
+              $executable = Join-Path $runnerRoot "externals/$runtime/bin/$nodeName"
+              if (-not [IO.File]::Exists($executable)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: bundled action interpreter is missing.' }
+              $info = Get-BundledNodeInfo $executable
+              Assert-ActionNodeVersion $runtime $info.version
+              Write-Output "Verified bundled action interpreter: $executable Node $($info.version)"
+            }
+          }
+
+          # Enumerate every effective JavaScript action runtime from the reviewed manifests.
+          Assert-RunnerActionRuntimes -Runtimes @('node24')
+      - name: Hold uncleared package-manager startup before actions
+        id: package-manager-client
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          throw 'CI_UNREVIEWED_PACKAGE_MANAGER_CLIENT: the npm/Yarn startup boundary has no approved advisory disposition. Review the actual clients and their bundled dependencies before removing this hold. A clean project lock audit does not clear the clients.'
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Validate release selection
         shell: bash
         env:
           RELEASE_BRANCH: ${{ inputs.release_branch }}
@@ -165,7 +537,8 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve release branch tip
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Resolve release branch tip
         id: branch
         shell: bash
         env:
@@ -180,7 +553,7 @@ jobs:
           echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
 
       - name: Require the publish dispatch to match the branch tip
-        if: inputs.phase == 'publish'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'publish') }}
         shell: bash
         env:
           BRANCH_SHA: ${{ steps.branch.outputs.sha }}
@@ -190,23 +563,30 @@ jobs:
             exit 1
           fi
 
-      - name: Check out release controller and Git history
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Check out release controller and Git history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Node.js for checkpoint validation
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Set up Node.js for checkpoint validation
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
 
-      - name: Install checkpoint validation dependencies
-        run: npm ci
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Check the actual Node security policy
+        run: node scripts/check-node-security.mjs
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Install checkpoint validation dependencies
+        run: npm run security:check && npm ci
 
-      - name: Validate checkpoint version and ancestry before release creation
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Validate checkpoint version and ancestry before release creation
         env:
           RELEASE_PHASE: ${{ inputs.phase }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
@@ -217,7 +597,7 @@ jobs:
           --source-sha "$SOURCE_SHA"
 
       - name: Validate manual finalized notes before release creation
-        if: inputs.phase == 'publish'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'publish') }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -226,7 +606,8 @@ jobs:
           node scripts/release-notes.mjs publication --repository "$GH_REPO" \
             --source "$SOURCE_SHA"
 
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
         with:
           # A dedicated credential starts PR CI automatically; the built-in
@@ -237,13 +618,13 @@ jobs:
           skip-github-pull-request: ${{ inputs.phase == 'publish' }}
 
       - name: Require a merged release PR for publication
-        if: inputs.phase == 'publish' && steps.release.outputs.release_created != 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'publish' && steps.release.outputs.release_created != 'true') }}
         run: |
           echo "No new release was created. Merge the reviewed release PR into its frozen branch before publishing. For a partial publication, re-run failed jobs in the original run." >&2
           exit 1
 
       - name: Bind publication to the dispatched checkpoint
-        if: inputs.phase == 'publish' && steps.release.outputs.release_created == 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'publish' && steps.release.outputs.release_created == 'true') }}
         shell: bash
         env:
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
@@ -254,7 +635,7 @@ jobs:
           fi
 
       - name: Check out release pull request
-        if: inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
@@ -262,18 +643,21 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js for generated documentation
-        if: inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
 
+      - name: Check the actual Node security policy
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
+        run: node scripts/check-node-security.mjs
       - name: Install dependencies
-        if: inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true'
-        run: npm ci
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
+        run: npm run security:check && npm ci
 
       - name: Validate prepared release version and migration notes
-        if: inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
         env:
           RELEASE_BRANCH: ${{ inputs.release_branch }}
           SOURCE_SHA: ${{ steps.branch.outputs.sha }}
@@ -283,11 +667,11 @@ jobs:
           --source-sha "$SOURCE_SHA"
 
       - name: Regenerate release documentation
-        if: inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
         run: npm run docs:generate
 
       - name: Validate generated release documentation
-        if: inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (inputs.phase == 'prepare' && steps.release.outputs.prs_created == 'true') }}
         run: npm run docs:check && git diff --exit-code
 
   qualification:
@@ -315,18 +699,146 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Verify every managed action interpreter before actions
+        id: action-runtime-bootstrap
+        shell: pwsh
+        run: |
+          # Caller contract from immutable action manifests. No pre hooks declared.
+          $requiredActionRuntimes = @('node20', 'node24')
+          if (@($requiredActionRuntimes | Where-Object { $_ -cne 'node24' }).Count) {
+            throw 'CI_UNSUPPORTED_ACTION_RUNTIME: this required job still declares Node 20 actions. Review compatible action replacements before execution. The node24 probe cannot clear Node 20.'
+          }
+          # Native hosted jobs only. Review immutable action manifests for pre hooks before use.
+          # No run step can precede action pre hooks, runner job hooks or early hashFiles().
+          # Any failure/always diagnostic action must also require this step's success.
+          # Floors: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+          # Expiry uses the schedule end date as an exclusive UTC cutoff, without an extra day.
+          # https://github.com/nodejs/Release/blob/main/schedule.json
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-ActionNodeVersion {
+            param([string]$Runtime, [string]$Version, [datetime]$AsOf = [datetime]::UtcNow)
+            $match = [regex]::Match($Version, '\A24\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z')
+            if ($Runtime -cne 'node24' -or -not $match.Success) {
+              throw 'CI_UNSUPPORTED_ACTION_RUNTIME: require a reviewed stable node24 interpreter; EOL, unknown and custom runtimes are refused.'
+            }
+            $minor = [int]$match.Groups[1].Value
+            $patch = [int]$match.Groups[2].Value
+            if ($minor -lt 22 -or ($minor -eq 22 -and $patch -lt 1) -or $AsOf.ToUniversalTime() -ge [datetime]::new(2028,4,30,0,0,0,[DateTimeKind]::Utc)) {
+              throw "CI_UNSUPPORTED_ACTION_RUNTIME: node24 requires Node 24.22.1 or later before its 2028-04-30 UTC expiry; received $Version. Use a patched provider image. Do not substitute PATH Node or waive a provider backport without evidence."
+            }
+          }
+
+          function Read-BoundedProbeText {
+            param([IO.Stream]$Stream, [datetime]$Deadline)
+            $buffer = [byte[]]::new(4097)
+            $used = 0
+            do {
+              $remaining = [int]($Deadline - [datetime]::UtcNow).TotalMilliseconds
+              if ($remaining -le 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $read = $Stream.ReadAsync($buffer, $used, $buffer.Length - $used)
+              if (-not $read.Wait($remaining)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $count = $read.Result
+              $used += $count
+            } while ($count -gt 0 -and $used -lt $buffer.Length)
+            if ($used -gt 4096) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: oversized interpreter output.' }
+            return [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $used)
+          }
+
+          function Get-BundledNodeInfo {
+            param([string]$Executable)
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add('--eval')
+            $start.ArgumentList.Add('process.stdout.write(JSON.stringify({version:process.versions.node,execPath:process.execPath}))')
+            $probe = [Diagnostics.Process]::new()
+            $probe.StartInfo = $start
+            $deadline = [datetime]::UtcNow.AddSeconds(5)
+            $started = $false
+            try {
+              $started = $probe.Start()
+              if (-not $started -or -not $probe.WaitForExit(5000)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe timed out.' }
+              $output = Read-BoundedProbeText $probe.StandardOutput.BaseStream $deadline
+              $errors = Read-BoundedProbeText $probe.StandardError.BaseStream $deadline
+              if ($probe.ExitCode -ne 0 -or $errors.Length -ne 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe failed or emitted diagnostics.' }
+              $info = ConvertFrom-Json -InputObject $output -AsHashtable
+              if ($info.version -isnot [string] -or $info.execPath -isnot [string]) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: malformed interpreter identity.' }
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetFullPath($Executable), [IO.Path]::GetFullPath($info.execPath), $comparison)) {
+                throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter identity does not match the bundled executable.'
+              }
+              return $info
+            } finally {
+              try {
+                if ($started -and -not $probe.HasExited) { $probe.Kill($true); $probe.WaitForExit(1000) | Out-Null }
+              } finally { $probe.Dispose() }
+            }
+          }
+
+          function Assert-RunnerActionRuntimes {
+            param([string[]]$Runtimes)
+            if (-not $Runtimes -or @($Runtimes | Where-Object { $_ -cne 'node24' }).Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: only explicitly reviewed node24 actions are supported; node20 is EOL.' }
+            $hostOS = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { '' }
+            if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne $hostOS -or $env:RUNNER_ARCH -notin @('X64','ARM64')) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unsupported hosted platform.' }
+            $unsafe = @(Get-ChildItem Env: | Where-Object {
+              $_.Value -and ($_.Name -in @('NODE_OPTIONS','ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION','ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION','ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED') -or $_.Name -match '\AFORCE_JAVASCRIPT_ACTIONS_TO_NODE[0-9]+\z')
+            })
+            if ($unsafe.Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreviewed Node options, migration override or runner hook. Refuse without printing its value.' }
+            $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction Stop)
+            if ($workers.Count -ne 1) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: missing or ambiguous Runner.Worker.' }
+            $ancestor = Get-Process -Id $PID -ErrorAction Stop
+            $owned = $false
+            for ($depth = 0; $ancestor -and $depth -lt 16; $depth++) {
+              if ($ancestor.Id -eq $workers[0].Id) { $owned = $true; break }
+              $ancestor = $ancestor.Parent
+            }
+            if (-not $owned) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: Runner.Worker is not a verified ancestor.' }
+            $workerPath = $workers[0].Path
+            $workerName = if ($IsWindows) { 'Runner.Worker.exe' } else { 'Runner.Worker' }
+            if (-not $workerPath -or -not [IO.Path]::IsPathFullyQualified($workerPath) -or [IO.Path]::GetFileName($workerPath) -cne $workerName) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreadable native worker path.' }
+            $bin = [IO.Path]::GetDirectoryName($workerPath)
+            if ([IO.Path]::GetFileName($bin) -cne 'bin' -or -not [IO.File]::Exists((Join-Path $bin 'Runner.Worker.dll'))) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unfamiliar worker layout.' }
+            $runnerRoot = [IO.Path]::GetDirectoryName($bin)
+            foreach ($runtime in @($Runtimes | Select-Object -Unique)) {
+              $nodeName = if ($IsWindows) { 'node.exe' } else { 'node' }
+              $executable = Join-Path $runnerRoot "externals/$runtime/bin/$nodeName"
+              if (-not [IO.File]::Exists($executable)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: bundled action interpreter is missing.' }
+              $info = Get-BundledNodeInfo $executable
+              Assert-ActionNodeVersion $runtime $info.version
+              Write-Output "Verified bundled action interpreter: $executable Node $($info.version)"
+            }
+          }
+
+          # Enumerate every effective JavaScript action runtime from the reviewed manifests.
+          Assert-RunnerActionRuntimes -Runtimes @('node24')
+      - name: Hold uncleared package-manager startup before actions
+        id: package-manager-client
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          throw 'CI_UNREVIEWED_PACKAGE_MANAGER_CLIENT: the npm/Yarn startup boundary has no approved advisory disposition. Review the actual clients and their bundled dependencies before removing this hold. A clean project lock audit does not clear the clients.'
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.merged-release.outputs.sha || needs.release-please.outputs.sha }}
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - run: npm ci
-      - uses: ./.github/actions/prepare-release-package
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Check the actual Node security policy
+        run: node scripts/check-node-security.mjs
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        run: npm run security:check && npm ci
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: ./.github/actions/prepare-release-package
         id: package
-      - name: Exercise the exact qualified tarball
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Exercise the exact qualified tarball
         env:
           VERIFIED_PACKAGE_TARBALL: ${{ steps.package.outputs.tarball }}
           VERIFIED_PACKAGE_VERSION: ${{ steps.package.outputs.version }}
@@ -343,23 +855,151 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Verify every managed action interpreter before actions
+        id: action-runtime-bootstrap
+        shell: pwsh
+        run: |
+          # Caller contract from immutable action manifests. No pre hooks declared.
+          $requiredActionRuntimes = @('node20', 'node24')
+          if (@($requiredActionRuntimes | Where-Object { $_ -cne 'node24' }).Count) {
+            throw 'CI_UNSUPPORTED_ACTION_RUNTIME: this required job still declares Node 20 actions. Review compatible action replacements before execution. The node24 probe cannot clear Node 20.'
+          }
+          # Native hosted jobs only. Review immutable action manifests for pre hooks before use.
+          # No run step can precede action pre hooks, runner job hooks or early hashFiles().
+          # Any failure/always diagnostic action must also require this step's success.
+          # Floors: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+          # Expiry uses the schedule end date as an exclusive UTC cutoff, without an extra day.
+          # https://github.com/nodejs/Release/blob/main/schedule.json
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-ActionNodeVersion {
+            param([string]$Runtime, [string]$Version, [datetime]$AsOf = [datetime]::UtcNow)
+            $match = [regex]::Match($Version, '\A24\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z')
+            if ($Runtime -cne 'node24' -or -not $match.Success) {
+              throw 'CI_UNSUPPORTED_ACTION_RUNTIME: require a reviewed stable node24 interpreter; EOL, unknown and custom runtimes are refused.'
+            }
+            $minor = [int]$match.Groups[1].Value
+            $patch = [int]$match.Groups[2].Value
+            if ($minor -lt 22 -or ($minor -eq 22 -and $patch -lt 1) -or $AsOf.ToUniversalTime() -ge [datetime]::new(2028,4,30,0,0,0,[DateTimeKind]::Utc)) {
+              throw "CI_UNSUPPORTED_ACTION_RUNTIME: node24 requires Node 24.22.1 or later before its 2028-04-30 UTC expiry; received $Version. Use a patched provider image. Do not substitute PATH Node or waive a provider backport without evidence."
+            }
+          }
+
+          function Read-BoundedProbeText {
+            param([IO.Stream]$Stream, [datetime]$Deadline)
+            $buffer = [byte[]]::new(4097)
+            $used = 0
+            do {
+              $remaining = [int]($Deadline - [datetime]::UtcNow).TotalMilliseconds
+              if ($remaining -le 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $read = $Stream.ReadAsync($buffer, $used, $buffer.Length - $used)
+              if (-not $read.Wait($remaining)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $count = $read.Result
+              $used += $count
+            } while ($count -gt 0 -and $used -lt $buffer.Length)
+            if ($used -gt 4096) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: oversized interpreter output.' }
+            return [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $used)
+          }
+
+          function Get-BundledNodeInfo {
+            param([string]$Executable)
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add('--eval')
+            $start.ArgumentList.Add('process.stdout.write(JSON.stringify({version:process.versions.node,execPath:process.execPath}))')
+            $probe = [Diagnostics.Process]::new()
+            $probe.StartInfo = $start
+            $deadline = [datetime]::UtcNow.AddSeconds(5)
+            $started = $false
+            try {
+              $started = $probe.Start()
+              if (-not $started -or -not $probe.WaitForExit(5000)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe timed out.' }
+              $output = Read-BoundedProbeText $probe.StandardOutput.BaseStream $deadline
+              $errors = Read-BoundedProbeText $probe.StandardError.BaseStream $deadline
+              if ($probe.ExitCode -ne 0 -or $errors.Length -ne 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe failed or emitted diagnostics.' }
+              $info = ConvertFrom-Json -InputObject $output -AsHashtable
+              if ($info.version -isnot [string] -or $info.execPath -isnot [string]) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: malformed interpreter identity.' }
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetFullPath($Executable), [IO.Path]::GetFullPath($info.execPath), $comparison)) {
+                throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter identity does not match the bundled executable.'
+              }
+              return $info
+            } finally {
+              try {
+                if ($started -and -not $probe.HasExited) { $probe.Kill($true); $probe.WaitForExit(1000) | Out-Null }
+              } finally { $probe.Dispose() }
+            }
+          }
+
+          function Assert-RunnerActionRuntimes {
+            param([string[]]$Runtimes)
+            if (-not $Runtimes -or @($Runtimes | Where-Object { $_ -cne 'node24' }).Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: only explicitly reviewed node24 actions are supported; node20 is EOL.' }
+            $hostOS = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { '' }
+            if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne $hostOS -or $env:RUNNER_ARCH -notin @('X64','ARM64')) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unsupported hosted platform.' }
+            $unsafe = @(Get-ChildItem Env: | Where-Object {
+              $_.Value -and ($_.Name -in @('NODE_OPTIONS','ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION','ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION','ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED') -or $_.Name -match '\AFORCE_JAVASCRIPT_ACTIONS_TO_NODE[0-9]+\z')
+            })
+            if ($unsafe.Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreviewed Node options, migration override or runner hook. Refuse without printing its value.' }
+            $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction Stop)
+            if ($workers.Count -ne 1) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: missing or ambiguous Runner.Worker.' }
+            $ancestor = Get-Process -Id $PID -ErrorAction Stop
+            $owned = $false
+            for ($depth = 0; $ancestor -and $depth -lt 16; $depth++) {
+              if ($ancestor.Id -eq $workers[0].Id) { $owned = $true; break }
+              $ancestor = $ancestor.Parent
+            }
+            if (-not $owned) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: Runner.Worker is not a verified ancestor.' }
+            $workerPath = $workers[0].Path
+            $workerName = if ($IsWindows) { 'Runner.Worker.exe' } else { 'Runner.Worker' }
+            if (-not $workerPath -or -not [IO.Path]::IsPathFullyQualified($workerPath) -or [IO.Path]::GetFileName($workerPath) -cne $workerName) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreadable native worker path.' }
+            $bin = [IO.Path]::GetDirectoryName($workerPath)
+            if ([IO.Path]::GetFileName($bin) -cne 'bin' -or -not [IO.File]::Exists((Join-Path $bin 'Runner.Worker.dll'))) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unfamiliar worker layout.' }
+            $runnerRoot = [IO.Path]::GetDirectoryName($bin)
+            foreach ($runtime in @($Runtimes | Select-Object -Unique)) {
+              $nodeName = if ($IsWindows) { 'node.exe' } else { 'node' }
+              $executable = Join-Path $runnerRoot "externals/$runtime/bin/$nodeName"
+              if (-not [IO.File]::Exists($executable)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: bundled action interpreter is missing.' }
+              $info = Get-BundledNodeInfo $executable
+              Assert-ActionNodeVersion $runtime $info.version
+              Write-Output "Verified bundled action interpreter: $executable Node $($info.version)"
+            }
+          }
+
+          # Enumerate every effective JavaScript action runtime from the reviewed manifests.
+          Assert-RunnerActionRuntimes -Runtimes @('node24')
+      - name: Hold uncleared package-manager startup before actions
+        id: package-manager-client
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          throw 'CI_UNREVIEWED_PACKAGE_MANAGER_CLIENT: the npm/Yarn startup boundary has no approved advisory disposition. Review the actual clients and their bundled dependencies before removing this hold. A clean project lock audit does not clear the clients.'
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.merged-release.outputs.sha || needs.release-please.outputs.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
           registry-url: https://registry.npmjs.org
 
-      - run: npm ci
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Check the actual Node security policy
+        run: node scripts/check-node-security.mjs
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        run: npm run security:check && npm ci
 
-      - uses: ./.github/actions/prepare-release-package
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: ./.github/actions/prepare-release-package
         id: package
 
-      - name: Inspect existing npm version
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Inspect existing npm version
         id: registry
         env:
           VERIFIED_PACKAGE_TARBALL: ${{ steps.package.outputs.tarball }}
@@ -367,7 +1007,7 @@ jobs:
         run: node scripts/ci/npm-release.mjs inspect "$VERIFIED_PACKAGE_TARBALL" "$VERIFIED_PACKAGE_VERSION"
 
       - name: Publish
-        if: steps.registry.outputs.published == 'false'
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' && (steps.registry.outputs.published == 'false') }}
         shell: bash
         env:
           VERIFIED_PACKAGE_TARBALL: ${{ steps.package.outputs.tarball }}
@@ -376,13 +1016,15 @@ jobs:
           tag="$(node scripts/release-npm-tag.mjs "$VERIFIED_PACKAGE_VERSION")"
           npm publish "${VERIFIED_PACKAGE_TARBALL}" --access public --tag "${tag}"
 
-      - name: Verify published npm bytes and dist-tag
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Verify published npm bytes and dist-tag
         env:
           VERIFIED_PACKAGE_TARBALL: ${{ steps.package.outputs.tarball }}
           VERIFIED_PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         run: node scripts/ci/npm-release.mjs verify "$VERIFIED_PACKAGE_TARBALL" "$VERIFIED_PACKAGE_VERSION"
 
-      - name: Verify published CLI from npm
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Verify published CLI from npm
         env:
           VERIFIED_PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         run: node scripts/verify-published-package.mjs "$VERIFIED_PACKAGE_VERSION"
@@ -399,12 +1041,140 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Verify every managed action interpreter before actions
+        id: action-runtime-bootstrap
+        shell: pwsh
+        run: |
+          # Caller contract from immutable action manifests. No pre hooks declared.
+          $requiredActionRuntimes = @('node24')
+          if (@($requiredActionRuntimes | Where-Object { $_ -cne 'node24' }).Count) {
+            throw 'CI_UNSUPPORTED_ACTION_RUNTIME: this required job still declares Node 20 actions. Review compatible action replacements before execution. The node24 probe cannot clear Node 20.'
+          }
+          # Native hosted jobs only. Review immutable action manifests for pre hooks before use.
+          # No run step can precede action pre hooks, runner job hooks or early hashFiles().
+          # Any failure/always diagnostic action must also require this step's success.
+          # Floors: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+          # Expiry uses the schedule end date as an exclusive UTC cutoff, without an extra day.
+          # https://github.com/nodejs/Release/blob/main/schedule.json
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-ActionNodeVersion {
+            param([string]$Runtime, [string]$Version, [datetime]$AsOf = [datetime]::UtcNow)
+            $match = [regex]::Match($Version, '\A24\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\z')
+            if ($Runtime -cne 'node24' -or -not $match.Success) {
+              throw 'CI_UNSUPPORTED_ACTION_RUNTIME: require a reviewed stable node24 interpreter; EOL, unknown and custom runtimes are refused.'
+            }
+            $minor = [int]$match.Groups[1].Value
+            $patch = [int]$match.Groups[2].Value
+            if ($minor -lt 22 -or ($minor -eq 22 -and $patch -lt 1) -or $AsOf.ToUniversalTime() -ge [datetime]::new(2028,4,30,0,0,0,[DateTimeKind]::Utc)) {
+              throw "CI_UNSUPPORTED_ACTION_RUNTIME: node24 requires Node 24.22.1 or later before its 2028-04-30 UTC expiry; received $Version. Use a patched provider image. Do not substitute PATH Node or waive a provider backport without evidence."
+            }
+          }
+
+          function Read-BoundedProbeText {
+            param([IO.Stream]$Stream, [datetime]$Deadline)
+            $buffer = [byte[]]::new(4097)
+            $used = 0
+            do {
+              $remaining = [int]($Deadline - [datetime]::UtcNow).TotalMilliseconds
+              if ($remaining -le 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $read = $Stream.ReadAsync($buffer, $used, $buffer.Length - $used)
+              if (-not $read.Wait($remaining)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter output timed out.' }
+              $count = $read.Result
+              $used += $count
+            } while ($count -gt 0 -and $used -lt $buffer.Length)
+            if ($used -gt 4096) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: oversized interpreter output.' }
+            return [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $used)
+          }
+
+          function Get-BundledNodeInfo {
+            param([string]$Executable)
+            $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add('--eval')
+            $start.ArgumentList.Add('process.stdout.write(JSON.stringify({version:process.versions.node,execPath:process.execPath}))')
+            $probe = [Diagnostics.Process]::new()
+            $probe.StartInfo = $start
+            $deadline = [datetime]::UtcNow.AddSeconds(5)
+            $started = $false
+            try {
+              $started = $probe.Start()
+              if (-not $started -or -not $probe.WaitForExit(5000)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe timed out.' }
+              $output = Read-BoundedProbeText $probe.StandardOutput.BaseStream $deadline
+              $errors = Read-BoundedProbeText $probe.StandardError.BaseStream $deadline
+              if ($probe.ExitCode -ne 0 -or $errors.Length -ne 0) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter probe failed or emitted diagnostics.' }
+              $info = ConvertFrom-Json -InputObject $output -AsHashtable
+              if ($info.version -isnot [string] -or $info.execPath -isnot [string]) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: malformed interpreter identity.' }
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetFullPath($Executable), [IO.Path]::GetFullPath($info.execPath), $comparison)) {
+                throw 'CI_UNSUPPORTED_ACTION_RUNTIME: interpreter identity does not match the bundled executable.'
+              }
+              return $info
+            } finally {
+              try {
+                if ($started -and -not $probe.HasExited) { $probe.Kill($true); $probe.WaitForExit(1000) | Out-Null }
+              } finally { $probe.Dispose() }
+            }
+          }
+
+          function Assert-RunnerActionRuntimes {
+            param([string[]]$Runtimes)
+            if (-not $Runtimes -or @($Runtimes | Where-Object { $_ -cne 'node24' }).Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: only explicitly reviewed node24 actions are supported; node20 is EOL.' }
+            $hostOS = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { '' }
+            if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne $hostOS -or $env:RUNNER_ARCH -notin @('X64','ARM64')) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unsupported hosted platform.' }
+            $unsafe = @(Get-ChildItem Env: | Where-Object {
+              $_.Value -and ($_.Name -in @('NODE_OPTIONS','ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION','ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION','ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED') -or $_.Name -match '\AFORCE_JAVASCRIPT_ACTIONS_TO_NODE[0-9]+\z')
+            })
+            if ($unsafe.Count) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreviewed Node options, migration override or runner hook. Refuse without printing its value.' }
+            $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction Stop)
+            if ($workers.Count -ne 1) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: missing or ambiguous Runner.Worker.' }
+            $ancestor = Get-Process -Id $PID -ErrorAction Stop
+            $owned = $false
+            for ($depth = 0; $ancestor -and $depth -lt 16; $depth++) {
+              if ($ancestor.Id -eq $workers[0].Id) { $owned = $true; break }
+              $ancestor = $ancestor.Parent
+            }
+            if (-not $owned) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: Runner.Worker is not a verified ancestor.' }
+            $workerPath = $workers[0].Path
+            $workerName = if ($IsWindows) { 'Runner.Worker.exe' } else { 'Runner.Worker' }
+            if (-not $workerPath -or -not [IO.Path]::IsPathFullyQualified($workerPath) -or [IO.Path]::GetFileName($workerPath) -cne $workerName) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unreadable native worker path.' }
+            $bin = [IO.Path]::GetDirectoryName($workerPath)
+            if ([IO.Path]::GetFileName($bin) -cne 'bin' -or -not [IO.File]::Exists((Join-Path $bin 'Runner.Worker.dll'))) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: unfamiliar worker layout.' }
+            $runnerRoot = [IO.Path]::GetDirectoryName($bin)
+            foreach ($runtime in @($Runtimes | Select-Object -Unique)) {
+              $nodeName = if ($IsWindows) { 'node.exe' } else { 'node' }
+              $executable = Join-Path $runnerRoot "externals/$runtime/bin/$nodeName"
+              if (-not [IO.File]::Exists($executable)) { throw 'CI_UNSUPPORTED_ACTION_RUNTIME: bundled action interpreter is missing.' }
+              $info = Get-BundledNodeInfo $executable
+              Assert-ActionNodeVersion $runtime $info.version
+              Write-Output "Verified bundled action interpreter: $executable Node $($info.version)"
+            }
+          }
+
+          # Enumerate every effective JavaScript action runtime from the reviewed manifests.
+          Assert-RunnerActionRuntimes -Runtimes @('node24')
+      - name: Hold uncleared package-manager startup before actions
+        id: package-manager-client
+        if: ${{ steps.action-runtime-bootstrap.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          throw 'CI_UNREVIEWED_PACKAGE_MANAGER_CLIENT: the npm/Yarn startup boundary has no approved advisory disposition. Review the actual clients and their bundled dependencies before removing this hold. A clean project lock audit does not clear the clients.'
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.merged-release.outputs.sha || needs.release-please.outputs.sha }}
           persist-credentials: false
 
-      - name: Verify package and registry metadata versions
-        run: npm run mcp-registry:check
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        name: Verify package and registry metadata versions
+        run: node scripts/check-node-security.mjs && npm run mcp-registry:check
 
-      - uses: ./.github/actions/publish-mcp
+      - if: ${{ steps.action-runtime-bootstrap.outcome == 'success' && steps.package-manager-client.outcome == 'success' }}
+        uses: ./.github/actions/publish-mcp

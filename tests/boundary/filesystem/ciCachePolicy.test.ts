@@ -169,17 +169,21 @@ printf '%s\n' 'C:\Users\runner with spaces\AppData\Local\npm-cache'
           const step = steps[index];
           if (step?.uses !== "./.github/actions/npm-cache") continue;
           npmCacheSteps++;
-          const setup = steps[index - 1];
+          const guard = steps[index - 1];
+          const setup = steps[index - 2];
+          expect(guard?.run).toBe("node scripts/check-node-security.mjs");
+          expect(guard?.if).toBe(setup?.if);
           expect(
             typeof setup?.uses === "string" &&
               setup.uses.startsWith("actions/setup-node@"),
-            `${file}:${jobName} npm cache action must immediately follow setup-node`,
+            `${file}:${jobName} npm cache action must follow setup-node and its runtime guard`,
           ).toBe(true);
           expect(step.if).toBe(setup?.if);
           expect(setup?.with).not.toHaveProperty("cache", "npm");
           const npmCiIndex = steps.findIndex(
             (candidate, candidateIndex) =>
-              candidateIndex > index && candidate.run === "npm ci",
+              candidateIndex > index &&
+              candidate.run === "npm run security:check && npm ci",
           );
           expect(
             npmCiIndex,

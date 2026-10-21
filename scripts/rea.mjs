@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+import { assertNodeSecurity } from "./check-node-security.mjs";
+
+assertNodeSecurity();
+
 import { access } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";

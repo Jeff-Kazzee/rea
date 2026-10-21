@@ -28,7 +28,9 @@ if (
   );
 if (outputs.tier === "full" && selectedScopes.length !== CI_FLAGS.length)
   throw new Error("Full qualification requires every canonical CI scope");
-const required = reused ? ["changes"] : ["changes", "static", "test"];
+const required = reused
+  ? ["changes", "node-security"]
+  : ["changes", "node-security", "static", "test"];
 const lanes = {
   code: [
     "build",
